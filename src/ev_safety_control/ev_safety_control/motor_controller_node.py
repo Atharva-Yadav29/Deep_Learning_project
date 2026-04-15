@@ -1,80 +1,112 @@
 import os
-from gpiozero import Device
-from gpiozero.pins.mock import MockFactory, MockPWMPin
-
-# Mock factory for your G15
-Device.pin_factory = MockFactory(pin_class=MockPWMPin)
+# Force the unlocked Ubuntu backend for hardware PWM
+os.environ['GPIOZERO_PIN_FACTORY'] = 'pigpio'
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String, Bool, Float32
-import curses
+from std_msgs.msg import Float32, Int32, String
 from gpiozero import PWMOutputDevice, DigitalOutputDevice
+import curses
+import threading
+import time
 
-class MotorController(Node):
-    def __init__(self, stdscr):
+class MotorControllerNode(Node):
+    def __init__(self):
         super().__init__('motor_controller')
-        self.stdscr = stdscr
+        
+        # Hardware Setup (BCM Numbering for TB6612FNG)
+        self.pwmb = PWMOutputDevice(18)
+        self.bin1 = DigitalOutputDevice(17)
+        self.bin2 = DigitalOutputDevice(27)
+        
+        # System States
+        self.throttle = 0.0
+        self.current_limit = 100  # Default 100% speed limit
+        
+        # ROS 2 Communication
+        self.create_subscription(Int32, '/system_limit', self.limit_callback, 10)
         self.pwm_pub = self.create_publisher(Float32, '/cmd_pwm', 10)
+        self.override_pub = self.create_publisher(String, '/detected_sign', 10) 
         
-        # Pins for TB6612FNG
-        self.motor_pwm = PWMOutputDevice(18)
-        self.in1 = DigitalOutputDevice(17)
-        self.in2 = DigitalOutputDevice(27)
+        self.get_logger().info("Motor Controller Active. Awaiting Keyboard Input.")
         
-        self.current_throttle = 0.0
-        self.pwm_limit = 1.0
-        
-        # --- ADDED RESET SUBSCRIPTION ---
-        self.create_subscription(String, '/detected_sign', self.safety_cb, 10)
-        self.create_subscription(Bool, '/driver_reset', self.reset_cb, 10)
-        
-        # Curses setup
-        curses.curs_set(0)
-        self.stdscr.nodelay(True)
-        self.stdscr.timeout(100) 
+        # Start the keyboard listener in a separate background thread
+        self.keyboard_thread = threading.Thread(target=self.start_curses_loop, daemon=True)
+        self.keyboard_thread.start()
 
-    def safety_cb(self, msg):
-        if 'speed_' in msg.data.lower():
-            self.pwm_limit = int(msg.data.split('_')[1]) / 100.0
-            self.get_logger().info(f'Speed Limit Active: {self.pwm_limit * 100}%')
+    def limit_callback(self, msg):
+        self.current_limit = msg.data
+        self.get_logger().info(f"Safety Limit Applied: {self.current_limit}%")
+        self.update_motor() # Apply the new limit immediately
 
-    # --- ADDED RESET CALLBACK ---
-    def reset_cb(self, msg):
-        if msg.data is True:
-            self.pwm_limit = 1.0
-            self.get_logger().info('Driver Overrode Safety: Limit Reset to 100%')
-
-    def run_loop(self):
-        while rclpy.ok():
-            key = self.stdscr.getch()
+    def update_motor(self):
+        # Calculate actual power based on user throttle and the Safety Manager's limit
+        safe_throttle = self.throttle * (self.current_limit / 100.0)
+        
+        # Set direction (Forward: BIN1=HIGH, BIN2=LOW)
+        if safe_throttle > 0:
+            self.bin1.on()
+            self.bin2.off()
+        else:
+            self.bin1.off()
+            self.bin2.off()
             
-            if key == ord('w'):
-                self.current_throttle = min(self.current_throttle + 0.1, self.pwm_limit)
-                self.get_logger().info(f'Key W pressed. Throttle: {self.current_throttle}')
-            elif key == ord('s'):
-                self.current_throttle = max(self.current_throttle - 0.1, 0.0)
-                self.get_logger().info(f'Key S pressed. Throttle: {self.current_throttle}')
-            elif key == ord(' '):
-                self.current_throttle = 0.0
-                self.get_logger().info('Emergency Brake!')
+        # Drive the PWM pin safely
+        self.pwmb.value = safe_throttle
+        
+        # Broadcast the current active throttle to the Web Dashboard
+        pwm_msg = Float32()
+        pwm_msg.data = safe_throttle
+        self.pwm_pub.publish(pwm_msg)
 
-            # Publishing the value
-            msg_out = Float32()
-            msg_out.data = float(self.current_throttle)
-            self.pwm_pub.publish(msg_out)
+    def start_curses_loop(self):
+        curses.wrapper(self.keyboard_loop)
 
-            # Hardware Update
-            if self.current_throttle > 0:
-                self.in1.on(); self.in2.off()
-                self.motor_pwm.value = self.current_throttle
-            else:
-                self.in1.off(); self.in2.off()
-                self.motor_pwm.value = 0.0
-
-            rclpy.spin_once(self, timeout_sec=0)
+    def keyboard_loop(self, stdscr):
+        stdscr.nodelay(True)
+        stdscr.clear()
+        stdscr.addstr("EV Motor Controller Active\n")
+        stdscr.addstr("Controls: [W] Accelerate | [Space] Brake | [X] Override Restriction\n")
+        
+        while rclpy.ok():
+            try:
+                key = stdscr.getch()
+                
+                if key != -1:
+                    if key == ord('w') or key == ord('W'):
+                        # Increase throttle in 10% increments
+                        self.throttle = min(1.0, self.throttle + 0.1)
+                        self.get_logger().info(f"Key W pressed. Throttle requested: {self.throttle:.1f}")
+                        self.update_motor()
+                        
+                    elif key == ord(' '): # Spacebar
+                        self.throttle = 0.0
+                        self.get_logger().info("Brakes Applied!")
+                        self.update_motor()
+                        
+                    elif key == ord('x') or key == ord('X'):
+                        # The Override Trick
+                        self.get_logger().info("Manual Override: Tricking Safety Manager to reset limit!")
+                        reset_msg = String()
+                        reset_msg.data = "Go Straight"
+                        self.override_pub.publish(reset_msg)
+                        
+            except Exception as e:
+                pass
+            
+            # Small sleep to prevent the keyboard loop from hogging the CPU
+            time.sleep(0.05)
 
 def main(args=None):
     rclpy.init(args=args)
-    curses.wrapper(lambda stdscr: MotorController(stdscr).run_loop())
-    rclpy.shutdown()
+    node = MotorControllerNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
