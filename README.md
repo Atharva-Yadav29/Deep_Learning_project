@@ -5,7 +5,8 @@
 ![TFLite](https://img.shields.io/badge/TensorFlow_Lite-Edge-FF6F00?logo=tensorflow)
 ![Hardware](https://img.shields.io/badge/Hardware-Raspberry_Pi_4-C51A4A?logo=raspberry-pi)
 
-Dataset Link : "https://www.kaggle.com/datasets/meowmeowmeowmeowmeow/gtsrb-german-traffic-sign"
+Mobile Net Dataset Link : "https://www.kaggle.com/datasets/meowmeowmeowmeowmeow/gtsrb-german-traffic-sign"
+YOLOv8n Dataset Link : "https://www.kaggle.com/datasets/ahemateja19bec1025/trafficsignlocalizationdetectionyoloannotated"
 
 A scalable, real-time Advanced Driver Assistance System (ADAS) and autonomous control framework built for resource-constrained edge devices. This project solves the **"Edge Compute Crisis"** by utilizing a decoupled ROS 2 microservice architecture and a heavily quantized TensorFlow Lite vision model to achieve high-FPS traffic sign recognition and active motor control strictly on CPU power.
 
